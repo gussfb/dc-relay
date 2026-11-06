@@ -1,5 +1,14 @@
 # dc-relay
 
+Quatro projetos de ESP32 neste repo:
+
+- **dc-relay** (este arquivo): monitor de bateria com corte automático de carga.
+- **[pc-button](pc-button/README.md)**: botão de power remoto de CPU via ESPHome.
+- **[bms-monitor](bms-monitor/README.md)**: monitor de tensão do banco off-grid 4S LiFePO4 (INA219) via ESPHome.
+- **[pressure-mca](pressure-MCA/README.md)**: pressão de água da usina (PT-307 4–20 mA + ADS1115, ESP32-C3) via ESPHome.
+
+---
+
 Monitor de bateria automotiva com ESP32 para desligamento automático de cargas DC (ex: Starlink Mini).
 
 ## O que faz
