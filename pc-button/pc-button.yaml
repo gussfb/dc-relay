@@ -1,0 +1,318 @@
+# Botão de power remoto para CPU.
+# Relé (via 2N2222 na GPIO23) em paralelo com os pinos PWR_SW da placa-mãe.
+substitutions:
+  # Portas sondadas no servidor, em ordem. Qualquer resposta TCP (aceita ou
+  # recusada) conta como vivo; só timeout conta como morto.
+  wd_host: !secret server_ip
+  wd_port1: "22"
+  wd_port2: "80"
+  wd_port3: "443"
+  wd_port4: "445"
+  wd_port5: "3389"
+  wd_timeout_ms: "250"     # por sonda
+  wd_misses: "3"           # minutos seguidos sem resposta antes do Start
+  wd_grace_s: "300"        # carência após qualquer acionamento do relé
+  wd_max_starts: "3"       # tentativas seguidas antes de desistir
+
+esphome:
+  name: pc-button
+  friendly_name: PC Button
+  includes:
+    - wd_probe.h
+  on_boot:
+    priority: 600
+    then:
+      - output.turn_off: relay_out
+
+esp32:
+  board: esp32dev
+  framework:
+    type: arduino
+
+logger:
+
+api:
+
+ota:
+  - platform: esphome
+
+wifi:
+  id: wifi_id
+  networks:
+    - ssid: !secret wifi_ssid
+      password: !secret wifi_password
+    - ssid: !secret wifi_ssid_lab
+      password: !secret wifi_password_lab
+  ap:
+    ssid: "pc-button"
+
+captive_portal:
+
+web_server:
+  port: 80
+  version: 3
+  sorting_groups:
+    - id: grp_power
+      name: "ENERGIA: aperta o botão físico da CPU"
+      sorting_weight: 10
+    - id: grp_wd
+      name: "Watchdog"
+      sorting_weight: 20
+    - id: grp_sys
+      name: "Sistema"
+      sorting_weight: 30
+
+output:
+  - platform: gpio
+    pin:
+      number: GPIO23
+      mode: output
+      inverted: false
+    id: relay_out
+
+globals:
+  - id: busy
+    type: bool
+    initial_value: "false"
+  - id: wd_miss
+    type: int
+    initial_value: "0"
+  - id: wd_starts
+    type: int
+    initial_value: "0"
+  - id: wd_hold_until
+    type: uint32_t
+    initial_value: "0"
+  - id: wd_status
+    type: std::string
+    initial_value: '"desligado"'
+
+script:
+  - id: press
+    mode: single
+    parameters:
+      hold_ms: int
+    then:
+      - globals.set:
+          id: busy
+          value: "true"
+      - lambda: |-
+          id(wd_hold_until) = millis() + ${wd_grace_s} * 1000UL;
+          id(wd_miss) = 0;
+      - output.turn_on: relay_out
+      - delay: !lambda "return hold_ms;"
+      - output.turn_off: relay_out
+      - globals.set:
+          id: busy
+          value: "false"
+
+  # Sonda os alvos em cadeia. Retorna assim que um responder.
+  # Grava o resultado em wd_status. Não mexe no relé.
+  - id: wd_probe_all
+    mode: single
+    then:
+      - lambda: |-
+          const char *host = id(wd_host_text).state.c_str();
+          const uint16_t ports[] = {${wd_port1}, ${wd_port2}, ${wd_port3}, ${wd_port4}, ${wd_port5}};
+          for (uint16_t p : ports) {
+            if (p == 0) continue;
+            WdResult r = wd_probe(host, p, ${wd_timeout_ms});
+            if (r == WD_ALIVE) {
+              id(wd_status) = std::string("vivo em ") + host + ":" + std::to_string(p);
+              id(wd_alive).publish_state(true);
+              return;
+            }
+          }
+          id(wd_status) = std::string("sem resposta de ") + host;
+          id(wd_alive).publish_state(false);
+
+  # Ciclo do watchdog, roda a cada minuto.
+  - id: wd_tick
+    mode: single
+    then:
+      - lambda: |-
+          if (!id(wd_enable).state) return;
+          if (!id(wifi_id).is_connected()) {
+            id(wd_status) = "ESP sem WiFi, ignorando";
+            id(wd_status_text).publish_state(id(wd_status));
+            return;
+          }
+          if ((int32_t)(millis() - id(wd_hold_until)) < 0) {
+            uint32_t left = (id(wd_hold_until) - millis()) / 1000;
+            id(wd_status) = "carência, " + std::to_string(left) + "s";
+            id(wd_status_text).publish_state(id(wd_status));
+            return;
+          }
+          if (id(busy)) return;
+          id(wd_probe_all).execute();
+          if (id(wd_alive).state) {
+            id(wd_miss) = 0;
+            id(wd_starts) = 0;
+          } else {
+            id(wd_miss)++;
+            id(wd_status) += ", falha " + std::to_string(id(wd_miss)) + "/${wd_misses}";
+            if (id(wd_miss) >= ${wd_misses}) {
+              if (id(wd_starts) >= ${wd_max_starts}) {
+                id(wd_status) = "DESISTI após ${wd_max_starts} starts, religue a chave";
+              } else {
+                id(wd_starts)++;
+                id(wd_miss) = 0;
+                id(wd_status) = "START automático " + std::to_string(id(wd_starts)) + "/${wd_max_starts}";
+                ESP_LOGW("watchdog", "%s", id(wd_status).c_str());
+                id(press).execute(400);
+              }
+            }
+          }
+          id(wd_status_text).publish_state(id(wd_status));
+
+interval:
+  - interval: 60s
+    then:
+      - script.execute: wd_tick
+
+text:
+  - platform: template
+    name: "Servidor IP"
+    id: wd_host_text
+    icon: mdi:ip-network
+    web_server:
+      sorting_group_id: grp_wd
+      sorting_weight: 2
+    mode: text
+    optimistic: true
+    restore_value: true
+    initial_value: "${wd_host}"
+    min_length: 7
+    max_length: 15
+
+switch:
+  - platform: template
+    name: "Destravar"
+    id: unlock
+    icon: mdi:lock-open-variant
+    optimistic: true
+    restore_mode: ALWAYS_OFF
+    web_server:
+      sorting_group_id: grp_power
+      sorting_weight: 1
+    on_turn_on:
+      - delay: 30s
+      - switch.turn_off: unlock
+
+  - platform: template
+    name: "Watchdog"
+    id: wd_enable
+    icon: mdi:shield-refresh
+    web_server:
+      sorting_group_id: grp_wd
+      sorting_weight: 1
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    on_turn_on:
+      - lambda: |-
+          id(wd_miss) = 0;
+          id(wd_starts) = 0;
+          id(wd_hold_until) = millis();
+          id(wd_status) = "ligado, aguardando primeiro ciclo";
+          id(wd_status_text).publish_state(id(wd_status));
+    on_turn_off:
+      - lambda: |-
+          id(wd_status) = "desligado";
+          id(wd_status_text).publish_state(id(wd_status));
+
+button:
+  - platform: template
+    name: "Testar watchdog"
+    icon: mdi:radar
+    web_server:
+      sorting_group_id: grp_wd
+      sorting_weight: 3
+    on_press:
+      - script.execute: wd_probe_all
+      - lambda: id(wd_status_text).publish_state(id(wd_status));
+
+  - platform: template
+    name: "Start"
+    icon: mdi:power
+    web_server:
+      sorting_group_id: grp_power
+      sorting_weight: 2
+    on_press:
+      - if:
+          condition:
+            lambda: "return id(unlock).state && !id(busy);"
+          then:
+            - switch.turn_off: unlock
+            - script.execute:
+                id: press
+                hold_ms: 400
+          else:
+            - logger.log:
+                level: WARN
+                format: "Start ignorado: travado ou pulso em andamento"
+
+  - platform: template
+    name: "Force Shutdown"
+    icon: mdi:power-off
+    web_server:
+      sorting_group_id: grp_power
+      sorting_weight: 3
+    on_press:
+      - if:
+          condition:
+            lambda: "return id(unlock).state && !id(busy);"
+          then:
+            - switch.turn_off: unlock
+            - script.execute:
+                id: press
+                hold_ms: 7000
+          else:
+            - logger.log:
+                level: WARN
+                format: "Force Shutdown ignorado: travado ou pulso em andamento"
+
+  - platform: restart
+    name: "Reiniciar ESP"
+    web_server:
+      sorting_group_id: grp_sys
+      sorting_weight: 9
+
+binary_sensor:
+  - platform: template
+    name: "Relé acionado"
+    lambda: "return id(busy);"
+    web_server:
+      sorting_group_id: grp_sys
+      sorting_weight: 1
+  - platform: template
+    name: "Servidor vivo"
+    id: wd_alive
+    icon: mdi:server-network
+    web_server:
+      sorting_group_id: grp_wd
+      sorting_weight: 5
+
+sensor:
+  - platform: wifi_signal
+    name: "WiFi"
+    web_server:
+      sorting_group_id: grp_sys
+      sorting_weight: 3
+    update_interval: 60s
+
+text_sensor:
+  - platform: template
+    name: "Watchdog status"
+    id: wd_status_text
+    icon: mdi:shield-refresh
+    web_server:
+      sorting_group_id: grp_wd
+      sorting_weight: 4
+    lambda: "return id(wd_status);"
+    update_interval: 60s
+  - platform: wifi_info
+    ip_address:
+      name: "IP"
+      web_server:
+        sorting_group_id: grp_sys
+        sorting_weight: 2
