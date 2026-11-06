@@ -1,0 +1,324 @@
+# Pressão de água da usina: PT-307 (0–2 bar, 4–20 mA, 2 fios) via ADS1115.
+# Laço: +24 V → sensor (vermelho) → sensor (preto) = ponto de leitura →
+#       shunt 8×1 kΩ em paralelo (125 Ω nominal) → GND.
+#       Ponto de leitura → 1 kΩ série → A0; 100 nF de A0 a GND.
+# Só medição. Sem controle de atuador/regulador/carga.
+substitutions:
+  name: pressure-mca
+  friendly_name: Pressão MCA
+
+  # Resistência do shunt em ohms. Trocar pelo valor medido no multímetro
+  # (sensor desligado, medir entre o ponto de leitura e GND).
+  shunt_ohms: "125.0"
+
+  # Faixa do sensor (placa do PT-307).
+  p_min_bar: "0.0"           # pressão em 4 mA
+  p_max_bar: "2.0"           # pressão em 20 mA
+
+  read_interval: 1s          # leitura do ADS1115
+  avg_samples: "5"           # média móvel da pressão "suavizada" (amostras)
+
+  # Diagnóstico da corrente do laço (mA). NÃO é NAMUR NE43.
+  # Nominal 4–20 mA. Banda OK = nominal ± 0,2 mA (≈1,25% do span): cobre
+  # precisão do sensor (~0,5% FS = 0,08 mA), tolerância do shunt já
+  # medido e ganho do ADS1115. Fora dela, mas dentro dos limiares de falha,
+  # a pressão continua sendo publicada (sem limitar), com aviso.
+  i_ok_min: "3.8"
+  i_ok_max: "20.2"
+  # Abaixo/acima disto a leitura de pressão é inválida (publica NaN →
+  # "desconhecido" no HA). Um transmissor de 2 fios vivo não opera muito
+  # abaixo de ~3,5 mA (precisa dessa corrente para a própria eletrônica);
+  # 3,0 mA deixa margem e só pega laço aberto/sem alimentação.
+  # 24 mA (3,0 V no shunt) fica acima da saturação típica de saída de
+  # transmissores e abaixo do teto do ADS1115 alimentado a 3,3 V.
+  i_fault_low: "3.0"
+  i_fault_high: "24.0"
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+
+esp32:
+  variant: esp32c3
+  board: esp32-c3-devkitm-1   # genérico C3, 4 MB flash
+  framework:
+    type: esp-idf
+
+logger:
+  # USB nativo do C3 (SuperMini, LOLIN C3 Mini). Se a placa tiver chip
+  # USB-serial (CH340/CP210x), trocar para UART0.
+  hardware_uart: USB_SERIAL_JTAG
+
+api:
+  encryption:
+    key: !secret api_encryption_key
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+  networks:
+    - ssid: !secret wifi_ssid
+      password: !secret wifi_password
+    - ssid: !secret wifi_ssid_lab
+      password: !secret wifi_password_lab
+    - ssid: !secret wifi_ssid_turbina
+      password: !secret wifi_password_turbina
+  # Alguns C3 SuperMini têm antena ruim e só conectam com potência menor.
+  # Descomentar se o Wi-Fi não associar ou cair muito.
+  # output_power: 8.5dB
+  ap:
+    ssid: "Pressure-MCA Fallback"
+    password: !secret ap_password
+
+captive_portal:
+
+web_server:
+  port: 80
+  version: 3
+
+i2c:
+  sda: GPIO5
+  scl: GPIO6
+  scan: true
+  frequency: 100kHz
+
+ads1115:
+  - address: 0x48
+    id: ads
+
+globals:
+  - id: i2c_fail_total
+    type: uint32_t
+    initial_value: "0"
+
+number:
+  # Calibração aplicada sobre a pressão nominal:
+  #   p = p_nominal × escala + zero
+  # Neutra: escala 1, zero 0. Persistem na flash.
+  - platform: template
+    name: "Calibração zero"
+    id: cal_zero
+    unit_of_measurement: "bar"
+    min_value: -0.5
+    max_value: 0.5
+    step: 0.001
+    initial_value: 0.0
+    optimistic: true
+    restore_value: true
+    mode: box
+    entity_category: config
+
+  - platform: template
+    name: "Calibração escala"
+    id: cal_span
+    min_value: 0.8
+    max_value: 1.2
+    step: 0.0001
+    initial_value: 1.0
+    optimistic: true
+    restore_value: true
+    mode: box
+    entity_category: config
+
+button:
+  - platform: template
+    name: "Calibração neutra"
+    entity_category: config
+    on_press:
+      - number.set:
+          id: cal_zero
+          value: 0.0
+      - number.set:
+          id: cal_span
+          value: 1.0
+
+  - platform: restart
+    name: "Reiniciar"
+
+sensor:
+  # Lido manualmente pelo interval abaixo. O componente ads1115 não publica
+  # nada quando o I²C falha (o HA ficaria com o último valor), então o
+  # interval chama sample(), que devolve NaN na falha, e publica tudo.
+  - platform: ads1115
+    id: adc_a0
+    ads1115_id: ads
+    multiplexer: A0_GND
+    gain: 4.096
+    sample_rate: "128"
+    update_interval: never
+    internal: true
+
+  - platform: template
+    name: "Tensão no shunt"
+    id: v_shunt
+    unit_of_measurement: "V"
+    device_class: voltage
+    state_class: measurement
+    accuracy_decimals: 4
+    update_interval: never
+    entity_category: diagnostic
+
+  - platform: template
+    name: "Corrente do sensor"
+    id: i_loop
+    unit_of_measurement: "mA"
+    device_class: current
+    state_class: measurement
+    accuracy_decimals: 3
+    update_interval: never
+    entity_category: diagnostic
+
+  - platform: template
+    name: "Pressão (sem filtro)"
+    id: p_raw
+    unit_of_measurement: "bar"
+    device_class: pressure
+    state_class: measurement
+    accuracy_decimals: 3
+    update_interval: never
+    entity_category: diagnostic
+
+  - platform: template
+    name: "Pressão"
+    id: p_avg
+    unit_of_measurement: "bar"
+    device_class: pressure
+    state_class: measurement
+    accuracy_decimals: 3
+    update_interval: never
+
+  - platform: template
+    name: "Coluna d'água"
+    id: p_mca
+    unit_of_measurement: "mca"
+    icon: mdi:waves-arrow-up
+    state_class: measurement
+    accuracy_decimals: 2
+    update_interval: never
+
+  - platform: template
+    name: "Falhas de leitura I²C"
+    id: i2c_fail_s
+    state_class: total_increasing
+    accuracy_decimals: 0
+    update_interval: never
+    entity_category: diagnostic
+
+  - platform: wifi_signal
+    name: "Sinal Wi-Fi"
+    update_interval: 60s
+
+  - platform: uptime
+    name: "Tempo ligado"
+    entity_category: diagnostic
+
+binary_sensor:
+  - platform: status
+    name: "Conectado"
+
+  - platform: template
+    name: "Falha de comunicação ADS1115"
+    id: bs_comm
+    device_class: problem
+    entity_category: diagnostic
+
+  - platform: template
+    name: "Falha no laço 4-20 mA"
+    id: bs_loop
+    device_class: problem
+    entity_category: diagnostic
+
+  - platform: template
+    name: "Corrente fora da faixa nominal"
+    id: bs_range
+    device_class: problem
+    entity_category: diagnostic
+
+text_sensor:
+  - platform: template
+    name: "Estado da medição"
+    id: st_txt
+    icon: mdi:gauge
+    update_interval: never
+
+  - platform: wifi_info
+    ip_address:
+      name: "IP"
+
+  # Versão do ESPHome + data de compilação; confirma qual firmware está rodando.
+  - platform: version
+    name: "Firmware"
+    entity_category: diagnostic
+
+interval:
+  - interval: ${read_interval}
+    then:
+      - lambda: |-
+          static const int N = ${avg_samples};
+          static float win[N];
+          static int n = 0, pos = 0;
+
+          const float v = id(adc_a0).sample();  // NaN se o I²C falhar
+          float i_ma = NAN, p = NAN, avg = NAN;
+          bool comm = false, loop = false, range = false;
+          const char *st;
+
+          if (std::isnan(v)) {
+            comm = true;
+            id(i2c_fail_total) += 1;
+            st = "Falha de comunicação com ADS1115";
+          } else {
+            i_ma = v / ${shunt_ohms} * 1000.0f;
+            if (i_ma < ${i_fault_low}) {
+              loop = true;
+              st = "Corrente baixa: laço aberto, sem 24 V ou sensor desconectado";
+            } else if (i_ma > ${i_fault_high}) {
+              loop = true;
+              st = "Corrente alta: curto ou falha na fiação";
+            } else {
+              // Sem limitar a 0–2 bar: fora da faixa sai negativo ou > 2 bar.
+              const float p_nom = ${p_min_bar} + (i_ma - 4.0f) / 16.0f * (${p_max_bar} - ${p_min_bar});
+              p = p_nom * id(cal_span).state + id(cal_zero).state;
+              if (i_ma < ${i_ok_min}) {
+                range = true;
+                st = "Abaixo da faixa nominal (< 4 mA)";
+              } else if (i_ma > ${i_ok_max}) {
+                range = true;
+                st = "Acima da faixa nominal (> 20 mA)";
+              } else {
+                st = "OK";
+              }
+            }
+          }
+
+          // Média móvel só de leituras válidas; qualquer falha zera a janela
+          // e a pressão suavizada vira NaN no mesmo ciclo.
+          if (std::isnan(p)) {
+            n = 0;
+            pos = 0;
+          } else {
+            win[pos] = p;
+            pos = (pos + 1) % N;
+            if (n < N) n++;
+            float sum = 0;
+            for (int k = 0; k < n; k++) sum += win[k];
+            avg = sum / n;
+          }
+
+          id(v_shunt).publish_state(v);
+          id(i_loop).publish_state(i_ma);
+          id(p_raw).publish_state(p);
+          id(p_avg).publish_state(avg);
+          id(p_mca).publish_state(avg * 10.1972f);
+          id(bs_comm).publish_state(comm);
+          id(bs_loop).publish_state(loop);
+          id(bs_range).publish_state(range);
+          if (id(i2c_fail_s).state != (float) id(i2c_fail_total))
+            id(i2c_fail_s).publish_state(id(i2c_fail_total));
+          if (id(st_txt).state != st) {
+            if (std::string(st) != "OK")
+              ESP_LOGW("pressao", "%s (V=%.4f, I=%.3f mA)", st, v, i_ma);
+            id(st_txt).publish_state(st);
+          }
